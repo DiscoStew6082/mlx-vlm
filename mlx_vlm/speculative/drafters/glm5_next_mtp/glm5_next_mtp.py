@@ -16,6 +16,8 @@ class Glm5NextMTPDraftModel(nn.Module):
     supports_ragged_batch_acceptance = False
     requires_filterable_batch_cache = True
     supports_batched_prompt_prefill = True
+    supports_incremental_prompt_prefill = True
+    supports_apc_prompt_prefill = False
 
     # Never-lose gate: a single nextn head caps the block at 2 tokens, so a round
     # only pays off when the draft is accepted often enough to clear the verify
@@ -156,6 +158,18 @@ class Glm5NextMTPDraftModel(nn.Module):
         shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
         h = self._forward_tokens(shifted, hidden[:, : shifted.shape[1], :], token_dtype)
         self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
+
+    def prefill_from_target_hidden_chunk(
+        self,
+        next_tokens: mx.array,
+        hidden: mx.array,
+        token_dtype: mx.Dtype = mx.int32,
+    ) -> mx.array:
+        return self._forward_tokens(
+            next_tokens.astype(token_dtype),
+            hidden[:, : next_tokens.shape[1], :],
+            token_dtype,
+        )
 
     def accept_verified_tokens(
         self,

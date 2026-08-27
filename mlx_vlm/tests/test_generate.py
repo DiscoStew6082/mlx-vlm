@@ -2032,6 +2032,68 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
     model.chunked_prefill_policy.assert_called_once()
 
 
+def test_generate_step_advances_incremental_mtp_prefill_across_chunks():
+    model = MagicMock()
+    model.no_chunked_prefill = False
+    model.chunked_prefill_policy.return_value = True
+
+    def target_forward(inputs=None, **kwargs):
+        seq = inputs.shape[1]
+        return SimpleNamespace(
+            logits=mx.zeros((1, seq, 8)),
+            hidden_states=[mx.zeros((1, seq, 4))],
+            shared_kv_states={},
+            cross_attention_states=None,
+            encoder_outputs=None,
+        )
+
+    model.language_model.side_effect = target_forward
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    observations = []
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[]),
+        supports_incremental_prompt_prefill=True,
+        reset=MagicMock(),
+        prefill_from_target_hidden_chunk=lambda tokens, hidden, _dtype: (
+            observations.append((tokens.tolist(), hidden.shape))
+        ),
+    )
+
+    with (
+        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(
+            ar_module, "run_speculative_rounds", return_value=iter(())
+        ) as rounds,
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            prefill_step_size=2,
+            draft_model=draft_model,
+            draft_kind="mtp",
+        )
+        list(gen)
+
+    draft_model.reset.assert_called_once_with(model)
+    assert observations == [
+        ([[2, 3]], (1, 2, 4)),
+        ([[4, 5]], (1, 2, 4)),
+    ]
+    assert rounds.call_args.kwargs["draft_prefill_started"] is True
+
+
 def test_chunked_prefill_policy_defaults_conservative_for_speculation():
     model = SimpleNamespace(no_chunked_prefill=False)
 
@@ -3076,6 +3138,27 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
     assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
+
+
+def test_mtp_without_apc_prefill_support_uses_visible_cold_fallback(caplog):
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.draft_kind = "mtp"
+    bg.draft_model = SimpleNamespace(supports_apc_prompt_prefill=False)
+    bg._wire_stack = None
+
+    with (
+        caplog.at_level(logging.INFO, logger="mlx_vlm.generate"),
+        patch.object(
+            BatchGenerator,
+            "_apc_pick_for",
+            side_effect=AssertionError("warm APC lookup must be skipped"),
+        ),
+    ):
+        batch = bg._build_mixed_prompt_batch([(1, [1, 2, 3], 1, {}, [], None)])
+
+    assert batch is None
+    assert "full cold prefill" in caplog.text
 
 
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():

@@ -43,6 +43,9 @@ from ..sample_utils import (
     top_p_sampling,
 )
 from ..speculative.utils import (
+    advance_incremental_prompt_prefill,
+    begin_incremental_prompt_prefill,
+    incremental_prompt_prefill_kwargs,
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
     speculative_hidden_state,
@@ -175,7 +178,10 @@ def _run_chunked_speculative_prefill(
     *,
     prefill_step_size: Optional[int],
     generation_stream,
-) -> Tuple[object, mx.array]:
+    draft_model=None,
+    draft_kind: Optional[str] = None,
+    left_padding: Optional[List[int]] = None,
+) -> Tuple[object, mx.array, bool]:
     """Prefill target cache in chunks, capturing speculative state only at end."""
     remaining_input_ids = input_ids
     remaining_embeds = inputs_embeds
@@ -185,24 +191,46 @@ def _run_chunked_speculative_prefill(
         batch_size=input_ids.shape[0],
         sequence_length=inputs_embeds.shape[1],
     )
+    draft_prefill_started = False
+    incremental_kwargs = {}
 
     if (
         prefill_step_size is not None
         and prefill_step_size > 0
         and remaining_embeds.shape[1] > prefill_step_size
     ):
+        if draft_model is not None and draft_kind is not None:
+            incremental_kwargs = incremental_prompt_prefill_kwargs(
+                draft_kind, draft_model
+            )
+        if incremental_kwargs:
+            draft_prefill_started = begin_incremental_prompt_prefill(
+                lm,
+                draft_model,
+                draft_kind=draft_kind,
+                left_padding=left_padding,
+            )
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
             chunk_kwargs = _slice_prefill_kwargs(
                 remaining_kwargs, sequence_keys, n_to_process
             )
+            chunk_kwargs = {**chunk_kwargs, **incremental_kwargs}
             with mx.stream(generation_stream):
-                lm(
+                chunk_output = lm(
                     remaining_input_ids[:, :n_to_process],
                     cache=prompt_cache,
                     inputs_embeds=remaining_embeds[:, :n_to_process],
                     n_to_process=n_to_process,
                     **chunk_kwargs,
+                )
+            if draft_prefill_started:
+                advance_incremental_prompt_prefill(
+                    draft_model,
+                    chunk_output,
+                    remaining_input_ids[:, 1 : n_to_process + 1],
+                    draft_kind=draft_kind,
+                    token_dtype=remaining_input_ids.dtype,
                 )
             mx.eval([c.state for c in prompt_cache])
             remaining_input_ids = remaining_input_ids[:, n_to_process:]
@@ -216,7 +244,7 @@ def _run_chunked_speculative_prefill(
     final_kwargs["inputs_embeds"] = remaining_embeds
     with mx.stream(generation_stream):
         out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
-    return out, remaining_input_ids
+    return out, remaining_input_ids, draft_prefill_started
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -2193,7 +2221,7 @@ class ResponseGenerator:
                     prefill_step_size = None
 
                 prompt_started = time.perf_counter()
-                out, input_mx = _run_chunked_speculative_prefill(
+                out, input_mx, draft_prefill_started = _run_chunked_speculative_prefill(
                     lm,
                     input_mx,
                     inputs_embeds_mx,
@@ -2202,6 +2230,9 @@ class ResponseGenerator:
                     prefill_kwargs,
                     prefill_step_size=prefill_step_size,
                     generation_stream=generation_stream,
+                    draft_model=drafter,
+                    draft_kind=draft_kind,
+                    left_padding=left_padding,
                 )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
@@ -2303,6 +2334,7 @@ class ResponseGenerator:
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
                     row_ids=sample_row_ids,
+                    draft_prefill_started=draft_prefill_started,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):

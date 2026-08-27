@@ -361,6 +361,18 @@ class Glm5NextIndexer(nn.Module):
 
         if mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S):
             valid_cur = mask
+        elif (
+            mask is not None
+            and mask.dtype == mx.bool_
+            and mask.ndim == 4
+            and mask.shape[0] in (1, B)
+            and mask.shape[-2] == S
+        ):
+            # Batched caches provide [B, H|1, S, K] causal/left-pad masks.
+            # A query position is real iff at least one key is visible to it.
+            valid_cur = mx.any(mx.any(mask, axis=-1), axis=1)
+            if valid_cur.shape[0] == 1 and B > 1:
+                valid_cur = mx.broadcast_to(valid_cur, (B, S))
         else:
             valid_cur = mx.ones((B, S), dtype=mx.bool_)
 

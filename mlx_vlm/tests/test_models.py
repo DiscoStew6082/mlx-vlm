@@ -3350,6 +3350,33 @@ class TestModels(unittest.TestCase):
         out = dsa(xs, mask4d, c2)  # must accept the 4-D mask and equal the None case
         self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
 
+    def test_glm5_next_indexer_caches_4d_left_padding_as_invalid(self):
+        from mlx_vlm.models.base import create_attention_mask
+        from mlx_vlm.models.cache import BatchKVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+        mx.random.seed(0)
+        cfg = self._glm5_next_mtp_text_config()
+        indexer = Glm5NextIndexer(cfg)
+        indexer.eval()
+        mx.eval(indexer.parameters())
+
+        cache = BatchKVCache([2, 0])
+        x = mx.random.normal((2, 4, cfg.hidden_size))
+        qr = mx.random.normal((2, 4, cfg.q_lora_rank))
+        mask = create_attention_mask(x, cache, return_array=True)
+
+        indexer(x, qr, mask, cache=cache)
+        cached_valid = cache.keys[:, 0, :4, -1] > 0
+
+        self.assertEqual(
+            cached_valid.tolist(),
+            [
+                [False, False, True, True],
+                [True, True, True, True],
+            ],
+        )
+
     def _glm5_next_mtp_text_config(self):
         from mlx_vlm.models import glm5_next
 
@@ -3563,6 +3590,7 @@ class TestModels(unittest.TestCase):
             def __init__(self, config):
                 super().__init__(config)
                 self.prefill_observations = []
+                self.chunk_prefill_observations = []
                 self.prefill_visible_keys = []
                 self.decode_visible_keys = []
 
@@ -3608,6 +3636,25 @@ class TestModels(unittest.TestCase):
                     greedy,
                 )
 
+            def prefill_from_target_hidden_chunk(
+                self,
+                next_tokens,
+                hidden,
+                token_dtype=mx.int32,
+            ):
+                self.chunk_prefill_observations.append(
+                    {
+                        "next_tokens": next_tokens.tolist(),
+                        "hidden_shape": hidden.shape,
+                        "left_padding": self._cache[0][0].left_padding.tolist(),
+                    }
+                )
+                return super().prefill_from_target_hidden_chunk(
+                    next_tokens,
+                    hidden,
+                    token_dtype,
+                )
+
         class NeverStop:
             def __call__(self, _token):
                 return False
@@ -3615,7 +3662,7 @@ class TestModels(unittest.TestCase):
             def add_eos_token_ids(self, _tokens):
                 return None
 
-        def generate(target, prompts, max_tokens, drafter=None):
+        def generate(target, prompts, max_tokens, drafter=None, prefill_step_size=None):
             processor = SimpleNamespace(
                 tokenizer=SimpleNamespace(stopping_criteria=NeverStop())
             )
@@ -3624,7 +3671,7 @@ class TestModels(unittest.TestCase):
                 processor,
                 prefill_batch_size=2,
                 completion_batch_size=2,
-                prefill_step_size=None,
+                prefill_step_size=prefill_step_size,
                 draft_model=drafter,
                 draft_kind="mtp" if drafter is not None else None,
                 draft_block_size=2,
@@ -3694,6 +3741,46 @@ class TestModels(unittest.TestCase):
             [
                 [False, False, True, True, True, True],
                 [True, True, True, True, True, True],
+            ],
+        )
+
+        chunked_drafter = RecordingDrafter(
+            ModelConfig(text_config=config, block_size=2)
+        )
+        chunked_drafter.eval()
+        mx.eval(chunked_drafter.parameters())
+        chunked_actual = generate(
+            target,
+            prompts,
+            max_tokens,
+            drafter=chunked_drafter,
+            prefill_step_size=2,
+        )
+
+        self.assertEqual(chunked_actual, expected)
+        self.assertEqual(
+            chunked_drafter.chunk_prefill_observations,
+            [
+                {
+                    "next_tokens": [[0, 2], [5, 7]],
+                    "hidden_shape": (2, 2, config.hidden_size),
+                    "left_padding": [2, 0],
+                },
+                {
+                    "next_tokens": [[4, 6], [9, 11]],
+                    "hidden_shape": (2, 2, config.hidden_size),
+                    "left_padding": [2, 0],
+                },
+            ],
+        )
+        self.assertEqual(
+            chunked_drafter.prefill_observations,
+            [
+                {
+                    "input_ids": [[6], [11]],
+                    "hidden_shape": (2, 1, config.hidden_size),
+                    "left_padding": [2, 0],
+                }
             ],
         )
 
