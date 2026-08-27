@@ -2032,68 +2032,6 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
     model.chunked_prefill_policy.assert_called_once()
 
 
-def test_generate_step_advances_incremental_mtp_prefill_across_chunks():
-    model = MagicMock()
-    model.no_chunked_prefill = False
-    model.chunked_prefill_policy.return_value = True
-
-    def target_forward(inputs=None, **kwargs):
-        seq = inputs.shape[1]
-        return SimpleNamespace(
-            logits=mx.zeros((1, seq, 8)),
-            hidden_states=[mx.zeros((1, seq, 4))],
-            shared_kv_states={},
-            cross_attention_states=None,
-            encoder_outputs=None,
-        )
-
-    model.language_model.side_effect = target_forward
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    observations = []
-    draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[]),
-        supports_incremental_prompt_prefill=True,
-        reset=MagicMock(),
-        prefill_from_target_hidden_chunk=lambda tokens, hidden, _dtype: (
-            observations.append((tokens.tolist(), hidden.shape))
-        ),
-    )
-
-    with (
-        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-        patch.object(
-            ar_module, "run_speculative_rounds", return_value=iter(())
-        ) as rounds,
-    ):
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-            prefill_step_size=2,
-            draft_model=draft_model,
-            draft_kind="mtp",
-        )
-        list(gen)
-
-    draft_model.reset.assert_called_once_with(model)
-    assert observations == [
-        ([[2, 3]], (1, 2, 4)),
-        ([[4, 5]], (1, 2, 4)),
-    ]
-    assert rounds.call_args.kwargs["draft_prefill_started"] is True
-
-
 def test_chunked_prefill_policy_defaults_conservative_for_speculation():
     model = SimpleNamespace(no_chunked_prefill=False)
 
@@ -3141,10 +3079,11 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
 
 
 def test_mtp_without_apc_prefill_support_uses_visible_cold_fallback(caplog):
+    draft_model = SimpleNamespace(supports_apc_prompt_prefill=False)
     bg = object.__new__(BatchGenerator)
     bg.apc_manager = object()
     bg.draft_kind = "mtp"
-    bg.draft_model = SimpleNamespace(supports_apc_prompt_prefill=False)
+    bg.draft_model = draft_model
     bg._wire_stack = None
 
     with (
@@ -3159,6 +3098,115 @@ def test_mtp_without_apc_prefill_support_uses_visible_cold_fallback(caplog):
 
     assert batch is None
     assert "full cold prefill" in caplog.text
+    assert draft_model._apc_fallback_logged is True
+
+    second_bg = object.__new__(BatchGenerator)
+    second_bg.apc_manager = object()
+    second_bg.draft_kind = "mtp"
+    second_bg.draft_model = draft_model
+    second_bg._wire_stack = None
+    assert second_bg._build_mixed_prompt_batch([]) is None
+    assert caplog.text.count("full cold prefill") == 1
+
+
+def test_mtp_apc_fallback_runs_two_cold_request_lifecycles(caplog):
+    class TinyAPCModel:
+        def __init__(self):
+            self.config = SimpleNamespace(eos_token_id=None)
+
+        def make_cache(self):
+            return [KVCache()]
+
+        def __call__(self, input_ids, cache=None, **_kwargs):
+            batch, length = input_ids.shape
+            if cache:
+                keys = mx.ones((batch, 1, length, 4), dtype=mx.float32)
+                values = mx.ones((batch, 1, length, 4), dtype=mx.float32)
+                cache[0].update_and_fetch(keys, values)
+            return SimpleNamespace(
+                logits=mx.zeros((batch, length, 8), dtype=mx.float32),
+                hidden_states=[mx.zeros((batch, length, 4), dtype=mx.float32)],
+                shared_kv_states={},
+            )
+
+    def make_generator(model, processor, manager, drafter):
+        return BatchGenerator(
+            model,
+            processor,
+            max_tokens=1,
+            prefill_batch_size=1,
+            completion_batch_size=1,
+            prefill_step_size=None,
+            apc_manager=manager,
+            draft_model=drafter,
+            draft_kind="mtp",
+            draft_block_size=2,
+            greedy_sampling=True,
+        )
+
+    def run_request(generator, prompt):
+        embeds = mx.ones((1, len(prompt), 4), dtype=mx.float32)
+        (uid,) = generator.insert(
+            [prompt],
+            max_tokens=1,
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": embeds,
+                    "_apc_semantic_hash": 123,
+                }
+            ],
+        )
+        cached_tokens = []
+        finished = False
+        for _ in range(10):
+            if not generator.has_work:
+                break
+            progress, responses = generator.next()
+            cached_tokens.extend(item.cached_tokens for item in progress)
+            finished = finished or any(
+                response.uid == uid and response.finish_reason is not None
+                for response in responses
+            )
+        assert not generator.has_work
+        assert finished
+        return cached_tokens
+
+    model = TinyAPCModel()
+    processor = MockProcessor()
+    manager = apc_module.APCManager(num_blocks=16, block_size=2)
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(block_size=2, target_layer_ids=[]),
+        supports_apc_prompt_prefill=False,
+    )
+    first_prompt = [1, 2, 3, 4, 5, 6]
+    second_prompt = [*first_prompt, 7]
+
+    caplog.set_level(logging.INFO, logger="mlx_vlm.generate")
+    first = make_generator(model, processor, manager, drafter)
+    try:
+        assert run_request(first, first_prompt) == [0]
+        assert manager.stats_snapshot()["stores"] == 0
+    finally:
+        first.close()
+
+    second = make_generator(model, processor, manager, drafter)
+    second._apc_pick_for = MagicMock(
+        side_effect=AssertionError("second request must not acquire warm APC blocks")
+    )
+    try:
+        assert run_request(second, second_prompt) == [0]
+        second._apc_pick_for.assert_not_called()
+    finally:
+        second.close()
+
+    stats = manager.stats_snapshot()
+    assert stats["lookups_hit"] == 0
+    assert stats["lookups_miss"] == 0
+    assert stats["stores"] == 0
+    assert stats["pool_used"] == 0
+    assert all(block.ref_cnt == 0 for block in manager.pool)
+    assert caplog.text.count("full cold prefill") == 1
+    manager.close()
 
 
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():

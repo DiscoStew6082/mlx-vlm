@@ -291,6 +291,8 @@ def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
     text_config = source_config.get("text_config") or source_config
     base_model_type = text_config.get("model_type") or source_config.get("model_type")
     splitter = get_mtp_splitter(base_model_type)
+    if splitter is None and text_config is not source_config:
+        splitter = get_mtp_splitter(source_config.get("model_type"))
     if splitter is None:
         return None
     tc = splitter.read_text_config(source_config)

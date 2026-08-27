@@ -656,7 +656,7 @@ def test_speculative_prefill_keeps_short_prompt_in_one_forward():
 
     input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
     inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
-    result, remaining_ids, started = server_generation._run_chunked_speculative_prefill(
+    result, remaining_ids = server_generation._run_chunked_speculative_prefill(
         lm,
         input_ids,
         inputs_embeds,
@@ -668,7 +668,6 @@ def test_speculative_prefill_keeps_short_prompt_in_one_forward():
     )
 
     assert result is output
-    assert started is False
     assert remaining_ids.tolist() == [[1, 2, 3]]
     assert len(calls) == 1
     assert calls[0][0].tolist() == [[1, 2, 3]]
@@ -686,7 +685,7 @@ def test_speculative_prefill_chunks_only_above_step_size():
 
     input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
     inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
-    _, remaining_ids, started = server_generation._run_chunked_speculative_prefill(
+    _, remaining_ids = server_generation._run_chunked_speculative_prefill(
         lm,
         input_ids,
         inputs_embeds,
@@ -698,55 +697,10 @@ def test_speculative_prefill_chunks_only_above_step_size():
     )
 
     assert remaining_ids.tolist() == [[3]]
-    assert started is False
     assert [call[0].tolist() for call in calls] == [[[1, 2]], [[3]]]
     assert calls[0][2]["n_to_process"] == 2
     assert "capture_layer_ids" not in calls[0][2]
     assert calls[1][2]["capture_layer_ids"] == [1, 2]
-
-
-def test_speculative_server_prefill_advances_incremental_mtp_chunks():
-    observations = []
-
-    def lm(inputs, cache=None, **kwargs):
-        seq = inputs.shape[1]
-        return SimpleNamespace(
-            logits=mx.zeros((1, seq, 5)),
-            hidden_states=[mx.zeros((1, seq, 4))],
-            shared_kv_states={},
-        )
-
-    draft_model = SimpleNamespace(
-        supports_incremental_prompt_prefill=True,
-        reset=lambda _model: observations.append("reset"),
-        prefill_from_target_hidden_chunk=lambda tokens, hidden, _dtype: (
-            observations.append((tokens.tolist(), hidden.shape))
-        ),
-    )
-    input_ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
-    inputs_embeds = mx.ones((1, 5, 4), dtype=mx.float32)
-
-    _, remaining_ids, started = server_generation._run_chunked_speculative_prefill(
-        lm,
-        input_ids,
-        inputs_embeds,
-        [],
-        {},
-        {"return_hidden": True, "return_shared_kv": True},
-        prefill_step_size=2,
-        generation_stream=mx.default_stream(mx.default_device()),
-        draft_model=draft_model,
-        draft_kind="mtp",
-        left_padding=[0],
-    )
-
-    assert remaining_ids.tolist() == [[5]]
-    assert started is True
-    assert observations == [
-        "reset",
-        ([[2, 3]], (1, 2, 4)),
-        ([[4, 5]], (1, 2, 4)),
-    ]
 
 
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):

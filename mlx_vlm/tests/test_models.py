@@ -3590,7 +3590,6 @@ class TestModels(unittest.TestCase):
             def __init__(self, config):
                 super().__init__(config)
                 self.prefill_observations = []
-                self.chunk_prefill_observations = []
                 self.prefill_visible_keys = []
                 self.decode_visible_keys = []
 
@@ -3636,25 +3635,6 @@ class TestModels(unittest.TestCase):
                     greedy,
                 )
 
-            def prefill_from_target_hidden_chunk(
-                self,
-                next_tokens,
-                hidden,
-                token_dtype=mx.int32,
-            ):
-                self.chunk_prefill_observations.append(
-                    {
-                        "next_tokens": next_tokens.tolist(),
-                        "hidden_shape": hidden.shape,
-                        "left_padding": self._cache[0][0].left_padding.tolist(),
-                    }
-                )
-                return super().prefill_from_target_hidden_chunk(
-                    next_tokens,
-                    hidden,
-                    token_dtype,
-                )
-
         class NeverStop:
             def __call__(self, _token):
                 return False
@@ -3662,7 +3642,7 @@ class TestModels(unittest.TestCase):
             def add_eos_token_ids(self, _tokens):
                 return None
 
-        def generate(target, prompts, max_tokens, drafter=None, prefill_step_size=None):
+        def generate(target, prompts, max_tokens, drafter=None):
             processor = SimpleNamespace(
                 tokenizer=SimpleNamespace(stopping_criteria=NeverStop())
             )
@@ -3671,7 +3651,7 @@ class TestModels(unittest.TestCase):
                 processor,
                 prefill_batch_size=2,
                 completion_batch_size=2,
-                prefill_step_size=prefill_step_size,
+                prefill_step_size=4,
                 draft_model=drafter,
                 draft_kind="mtp" if drafter is not None else None,
                 draft_block_size=2,
@@ -3707,7 +3687,7 @@ class TestModels(unittest.TestCase):
         target = LanguageModel(config)
         target.eval()
         mx.eval(target.parameters())
-        prompts = [[2, 4, 6], [3, 5, 7, 9, 11]]
+        prompts = [[2], [3, 5, 7, 9, 11, 13]]
         max_tokens = [3, 5]
 
         expected = generate(target, prompts, max_tokens)
@@ -3723,64 +3703,24 @@ class TestModels(unittest.TestCase):
             drafter.prefill_observations,
             [
                 {
-                    "input_ids": [[0, 0, 2, 4, 6], [3, 5, 7, 9, 11]],
-                    "hidden_shape": (2, 5, config.hidden_size),
-                    "left_padding": [2, 0],
+                    "input_ids": [[0, 2], [11, 13]],
+                    "hidden_shape": (2, 2, config.hidden_size),
+                    "left_padding": [1, 0],
                 }
             ],
         )
         self.assertEqual(
             drafter.prefill_visible_keys,
             [
-                [False, False, True, True, True],
-                [True, True, True, True, True],
+                [False, True],
+                [True, True],
             ],
         )
         self.assertEqual(
             drafter.decode_visible_keys,
             [
-                [False, False, True, True, True, True],
-                [True, True, True, True, True, True],
-            ],
-        )
-
-        chunked_drafter = RecordingDrafter(
-            ModelConfig(text_config=config, block_size=2)
-        )
-        chunked_drafter.eval()
-        mx.eval(chunked_drafter.parameters())
-        chunked_actual = generate(
-            target,
-            prompts,
-            max_tokens,
-            drafter=chunked_drafter,
-            prefill_step_size=2,
-        )
-
-        self.assertEqual(chunked_actual, expected)
-        self.assertEqual(
-            chunked_drafter.chunk_prefill_observations,
-            [
-                {
-                    "next_tokens": [[0, 2], [5, 7]],
-                    "hidden_shape": (2, 2, config.hidden_size),
-                    "left_padding": [2, 0],
-                },
-                {
-                    "next_tokens": [[4, 6], [9, 11]],
-                    "hidden_shape": (2, 2, config.hidden_size),
-                    "left_padding": [2, 0],
-                },
-            ],
-        )
-        self.assertEqual(
-            chunked_drafter.prefill_observations,
-            [
-                {
-                    "input_ids": [[6], [11]],
-                    "hidden_shape": (2, 1, config.hidden_size),
-                    "left_padding": [2, 0],
-                }
+                [False, True, True],
+                [True, True, True],
             ],
         )
 
@@ -16822,6 +16762,35 @@ class TestMTPSplit(unittest.TestCase):
             self.assertIsNotNone(splitter)
             self.assertEqual(splitter.output_model_type, "qwen3_5_mtp")
             split_mtp(src, out)  # auto-detect dispatch
+            self.assertTrue((Path(out) / "model.safetensors").exists())
+
+    def test_detect_and_split_glm5_next_mtp_uses_root_model_type(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+        from mlx_vlm.split_mtp import split_mtp
+
+        cfg = {
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text",
+                "num_hidden_layers": 1,
+                "num_nextn_predict_layers": 1,
+                "n_routed_experts": 0,
+            },
+        }
+        weights = {
+            "model.language_model.layers.1.eh_proj.weight": mx.random.normal((8, 8))
+        }
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(tmp, cfg, weights)
+
+            splitter = detect_mtp_splitter(Path(src))
+
+            self.assertIsNotNone(splitter)
+            self.assertEqual(splitter.output_model_type, "glm5_next_mtp")
+            split_mtp(src, out)
             self.assertTrue((Path(out) / "model.safetensors").exists())
 
     def test_detect_returns_none_when_flag_but_no_tensors(self):

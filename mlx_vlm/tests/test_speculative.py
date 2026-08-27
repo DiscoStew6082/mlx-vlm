@@ -3466,8 +3466,8 @@ def test_split_glm5_next_mtp_converts_fine_grained_fp8(tmp_path):
         "num_hidden_layers": 1,
         "num_nextn_predict_layers": 1,
         "n_routed_experts": 1,
-        "qk_nope_head_dim": 4,
-        "v_head_dim": 4,
+        "qk_nope_head_dim": 32,
+        "v_head_dim": 32,
         "num_attention_heads": 2,
     }
     (source / "config.json").write_text(
@@ -3488,6 +3488,8 @@ def test_split_glm5_next_mtp_converts_fine_grained_fp8(tmp_path):
     scale = mx.full((1, 1), 0.125, dtype=mx.bfloat16)
     tensors = {
         f"{prefix}eh_proj.weight": mx.ones((128, 128), dtype=mx.bfloat16),
+        f"{prefix}self_attn.kv_b_proj.weight": fp8,
+        f"{prefix}self_attn.kv_b_proj.weight_scale_inv": scale,
     }
     for projection in ("down_proj", "gate_proj", "up_proj"):
         key = f"{prefix}mlp.experts.0.{projection}.weight"
@@ -3517,7 +3519,51 @@ def test_split_glm5_next_mtp_converts_fine_grained_fp8(tmp_path):
         assert mx.max(mx.abs(restored - source_value)).item() <= 0.015625
     assert weights["mtp.eh_proj.weight"].dtype == mx.bfloat16
     assert "mtp.eh_proj.scales" not in weights
+    for projection in ("embed_q", "unembed_out"):
+        key = f"mtp.self_attn.{projection}"
+        assert weights[f"{key}.weight"].dtype == mx.uint32
+        assert weights[f"{key}.scales"].dtype == mx.uint8
     assert not any(key.endswith("weight_scale_inv") for key in weights)
+
+
+def test_split_glm5_next_mtp_preserves_native_mlx_quantization(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": {
+                    "model_type": "glm5_next_text",
+                    "num_hidden_layers": 1,
+                    "num_nextn_predict_layers": 1,
+                    "n_routed_experts": 0,
+                },
+                "quantization": quantization,
+                "quantization_config": quantization,
+            }
+        )
+    )
+    prefix = "model.language_model.layers.1.eh_proj"
+    packed = mx.full((8, 2), 17, dtype=mx.uint32)
+    scales = mx.full((8, 1), 3, dtype=mx.uint8)
+    mx.save_safetensors(
+        str(source / "mtp.safetensors"),
+        {f"{prefix}.weight": packed, f"{prefix}.scales": scales},
+        metadata={"format": "mlx"},
+    )
+
+    split_glm5_next_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    assert cfg["quantization"] == quantization
+    assert cfg["quantization_config"] == quantization
+    assert mx.array_equal(weights["mtp.eh_proj.weight"], packed).item()
+    assert mx.array_equal(weights["mtp.eh_proj.scales"], scales).item()
 
 
 def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():

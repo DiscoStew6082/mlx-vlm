@@ -61,55 +61,11 @@ __all__ = [
     "make_speculative_prompt_cache",
     "run_speculative_rounds",
     "run_speculative_server_rounds",
-    "advance_incremental_prompt_prefill",
-    "begin_incremental_prompt_prefill",
-    "incremental_prompt_prefill_kwargs",
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
     "speculative_stats_since",
     "speculative_stats_snapshot",
 ]
-
-
-def incremental_prompt_prefill_kwargs(draft_kind: str, draft_model) -> dict:
-    if draft_kind == "mtp" and getattr(
-        draft_model, "supports_incremental_prompt_prefill", False
-    ):
-        return {"return_hidden": True}
-    return {}
-
-
-def begin_incremental_prompt_prefill(
-    model: nn.Module,
-    draft_model: nn.Module,
-    *,
-    draft_kind: str,
-    left_padding: Optional[List[int]] = None,
-) -> bool:
-    if not incremental_prompt_prefill_kwargs(draft_kind, draft_model):
-        return False
-    if left_padding is not None and len(left_padding) > 1:
-        draft_model.reset(model, left_padding=left_padding)
-    else:
-        draft_model.reset(model)
-    return True
-
-
-def advance_incremental_prompt_prefill(
-    draft_model: nn.Module,
-    outputs: Any,
-    next_tokens: mx.array,
-    *,
-    draft_kind: str,
-    token_dtype: mx.Dtype,
-) -> None:
-    prefill_chunk = getattr(draft_model, "prefill_from_target_hidden_chunk", None)
-    if not callable(prefill_chunk) or next_tokens.shape[1] == 0:
-        return
-    hidden = speculative_hidden_state(draft_kind, outputs)
-    draft_output = prefill_chunk(next_tokens, hidden, token_dtype)
-    if draft_output is not None:
-        mx.async_eval(draft_output)
 
 
 def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
@@ -189,7 +145,6 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
-    draft_prefill_started: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
@@ -248,7 +203,6 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
-            draft_prefill_started=draft_prefill_started,
         )
         return
 
@@ -306,7 +260,6 @@ def run_speculative_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
-    draft_prefill_started: bool = False,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
@@ -332,7 +285,6 @@ def run_speculative_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=input_ids.dtype,
                 greedy_sampling=sampler_is_greedy,
-                draft_prefill_started=draft_prefill_started,
             )
         else:
             mx.eval(first_token)
@@ -361,7 +313,6 @@ def run_speculative_rounds(
                 token_dtype=input_ids.dtype,
                 eos_token_ids=eos_set,
                 greedy_sampling=sampler_is_greedy,
-                draft_prefill_started=draft_prefill_started,
             )
         return
 

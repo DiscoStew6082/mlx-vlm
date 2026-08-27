@@ -121,6 +121,15 @@ class Glm5NextMTPSplitter(MTPSplitter):
                 v[:, :nope, :].swapaxes(-1, -2)
             )
             out["self_attn.unembed_out.weight"] = mx.contiguous(v[:, nope:, :])
+            mapped_kb = f"mtp.{kb}"
+            if mapped_kb in mapped_fp8_keys:
+                mapped_fp8_keys.remove(mapped_kb)
+                mapped_fp8_keys.update(
+                    {
+                        "mtp.self_attn.embed_q.weight",
+                        "mtp.self_attn.unembed_out.weight",
+                    }
+                )
 
         self._source_fp8_weight_keys = mapped_fp8_keys
         return {f"mtp.{key}": value for key, value in out.items()}
@@ -149,6 +158,10 @@ class Glm5NextMTPSplitter(MTPSplitter):
                         self._source_fp8_weight_keys.add(stacked_key)
 
     def quantization_from_source(self, tensors, source_config):
+        if any(key.endswith(".scales") for key in tensors):
+            return source_config.get("quantization") or source_config.get(
+                "quantization_config"
+            )
         if not self._source_fp8_weight_keys:
             return None
         source_quantization = source_config.get("quantization_config") or {}

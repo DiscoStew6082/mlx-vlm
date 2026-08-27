@@ -21,9 +21,6 @@ from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
-    advance_incremental_prompt_prefill,
-    begin_incremental_prompt_prefill,
-    incremental_prompt_prefill_kwargs,
     make_speculative_prompt_cache,
     run_speculative_rounds,
     run_speculative_server_rounds,
@@ -330,7 +327,6 @@ def generate_step(
     # Speculative decoding setup
     last_outputs = None
     speculative_prefill_capture_kwargs = {}
-    draft_prefill_started = False
     if draft_model is not None:
         from ..speculative.drafters import validate_drafter_compatibility
 
@@ -446,17 +442,6 @@ def generate_step(
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
             processed_tokens = 0
-            incremental_kwargs = {}
-            if draft_model is not None:
-                incremental_kwargs = incremental_prompt_prefill_kwargs(
-                    draft_kind, draft_model
-                )
-            if incremental_kwargs:
-                draft_prefill_started = begin_incremental_prompt_prefill(
-                    model,
-                    draft_model,
-                    draft_kind=draft_kind,
-                )
             with tqdm(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
             ) as pbar:
@@ -470,25 +455,15 @@ def generate_step(
                     ):
                         n_to_process = checkpoint_len - processed_tokens
                     chunk_kwargs = kwargs
-                    if incremental_kwargs:
-                        chunk_kwargs = {**chunk_kwargs, **incremental_kwargs}
                     if getattr(model.language_model, "supports_logits_to_keep", False):
-                        chunk_kwargs = {**chunk_kwargs, "logits_to_keep": 1}
-                    chunk_output = model.language_model(
+                        chunk_kwargs = {**kwargs, "logits_to_keep": 1}
+                    model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
                         **chunk_kwargs,
                     )
-                    if draft_prefill_started:
-                        advance_incremental_prompt_prefill(
-                            draft_model,
-                            chunk_output,
-                            input_ids[:, 1 : n_to_process + 1],
-                            draft_kind=draft_kind,
-                            token_dtype=input_ids.dtype,
-                        )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
@@ -525,7 +500,6 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
-            draft_prefill_started=draft_prefill_started,
         )
         return
 
@@ -1450,7 +1424,6 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
-        draft_prefill_started: bool = False,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1468,7 +1441,6 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
-        self.draft_prefill_started = draft_prefill_started
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1555,7 +1527,6 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
-            draft_prefill_started=self.draft_prefill_started,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1668,7 +1639,6 @@ class PromptProcessingBatch:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
-        self._draft_prefill_started = False
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -1930,34 +1900,13 @@ class PromptProcessingBatch:
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
-        incremental_kwargs = {}
-        if self.draft_model is not None and self.draft_kind is not None:
-            incremental_kwargs = incremental_prompt_prefill_kwargs(
-                self.draft_kind, self.draft_model
-            )
-        if incremental_kwargs and not self._draft_prefill_started:
-            self._draft_prefill_started = begin_incremental_prompt_prefill(
-                self.model,
-                self.draft_model,
-                draft_kind=self.draft_kind,
-                left_padding=self._left_padding_per_row,
-            )
-        prompt_kwargs.update(incremental_kwargs)
-        output = self.model(
+        self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
             **prompt_kwargs,
         )
-        if self._draft_prefill_started:
-            advance_incremental_prompt_prefill(
-                self.draft_model,
-                output,
-                self._input_ids[:, 1 : n + 1],
-                draft_kind=self.draft_kind,
-                token_dtype=self._input_ids.dtype,
-            )
         mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
@@ -2085,7 +2034,6 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
-                draft_prefill_started=self._draft_prefill_started,
             )
             compute_logprobs = False
         else:
@@ -2450,12 +2398,12 @@ class BatchGenerator:
         if draft_model is not None and not getattr(
             draft_model, "supports_apc_prompt_prefill", True
         ):
-            if not getattr(self, "_apc_draft_fallback_logged", False):
+            if not getattr(draft_model, "_apc_fallback_logged", False):
                 logger.info(
                     "APC warm-prefix reuse is unavailable for %s; using full cold prefill.",
                     type(draft_model).__name__,
                 )
-                self._apc_draft_fallback_logged = True
+                draft_model._apc_fallback_logged = True
             return None
 
         picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
@@ -2627,6 +2575,11 @@ class BatchGenerator:
         produced K/V are added to APC after prefill.
         """
         if self.apc_manager is None:
+            return None
+        draft_model = getattr(self, "draft_model", None)
+        if draft_model is not None and not getattr(
+            draft_model, "supports_apc_prompt_prefill", True
+        ):
             return None
         meta: List[Optional[dict]] = []
         for ids_list, kw in zip(input_ids_list, prompt_kwargs_list):

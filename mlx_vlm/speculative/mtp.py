@@ -649,7 +649,6 @@ def _mtp_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
-    draft_prefill_started: bool = False,
 ) -> Generator[Tuple[int, None], None, None]:
     """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
 
@@ -669,8 +668,7 @@ def _mtp_rounds(
 
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
-    if not draft_prefill_started:
-        draft_model.reset(model)
+    draft_model.reset(model)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling
@@ -850,7 +848,7 @@ def _mtp_cache_positions(
 def _mtp_batch_prompt_left_padding(
     prompt_cache: List[Any], prompt_tokens: mx.array, batch_size: int
 ) -> Optional[List[int]]:
-    """Return canonical prompt padding, ignoring advanced recurrent caches."""
+    """Return residual suffix padding from a target KV cache."""
     width = int(prompt_tokens.shape[1])
 
     def find(entry: Any) -> Optional[List[int]]:
@@ -862,7 +860,8 @@ def _mtp_batch_prompt_left_padding(
                     return result
 
         left_padding = getattr(entry, "left_padding", None)
-        if left_padding is None:
+        cached_width = getattr(entry, "_idx", None)
+        if left_padding is None or cached_width is None:
             return None
         values = (
             left_padding.tolist()
@@ -871,7 +870,8 @@ def _mtp_batch_prompt_left_padding(
         )
         if len(values) != batch_size:
             return None
-        values = [int(value) for value in values]
+        processed_columns = max(int(cached_width) - width, 0)
+        values = [max(int(value) - processed_columns, 0) for value in values]
         if all(0 <= value <= width for value in values):
             return values
         return None
@@ -999,7 +999,6 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
-    draft_prefill_started: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1033,18 +1032,17 @@ def _mtp_rounds_batch(
         if batch_prefill
         else None
     )
-    if not draft_prefill_started:
-        if getattr(draft_model, "supports_ragged_batch_acceptance", False) or (
-            B > 1 and getattr(draft_model, "requires_filterable_batch_cache", False)
-        ):
-            reset_left_padding = (
-                batch_left_padding
-                if batch_prefill and batch_left_padding is not None
-                else [0] * B
-            )
-            draft_model.reset(model, left_padding=reset_left_padding)
-        else:
-            draft_model.reset(model)
+    if getattr(draft_model, "supports_ragged_batch_acceptance", False) or (
+        B > 1 and getattr(draft_model, "requires_filterable_batch_cache", False)
+    ):
+        reset_left_padding = (
+            batch_left_padding
+            if batch_prefill and batch_left_padding is not None
+            else [0] * B
+        )
+        draft_model.reset(model, left_padding=reset_left_padding)
+    else:
+        draft_model.reset(model)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling
