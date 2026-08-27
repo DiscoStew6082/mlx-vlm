@@ -11,6 +11,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     QSAKVCache,
     QSAQuantizedKVCache,
+    Qwen4ExpAttention,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpNGramEmbedding,
     ShardedEmbedding,
@@ -299,6 +300,108 @@ class Qwen4ExpTests(unittest.TestCase):
 
         self.assertEqual(len(caches), 2)
         self.assertIsInstance(caches[1], BatchQSAKVCache)
+
+    def test_left_padded_qsa_batch_prefill_and_decode(self):
+        model = qwen4_exp.Model(tiny_config()).language_model
+        cache = _make_cache(model, [2, 0])
+        input_ids = mx.array([[0, 0, *range(10)], list(range(12))], dtype=mx.int32)
+        positions = mx.array([[0, 0, *range(10)], list(range(12))], dtype=mx.int32)
+
+        prefill = model(input_ids, cache=cache, position_ids=positions).logits
+        decode = model(
+            mx.array([[10], [12]], dtype=mx.int32),
+            cache=cache,
+            position_ids=mx.array([[10], [12]], dtype=mx.int32),
+        ).logits
+        mx.eval(prefill, decode)
+
+        self.assertEqual(prefill.shape, (2, 12, 64))
+        self.assertEqual(decode.shape, (2, 1, 64))
+        self.assertIsInstance(cache[1], BatchQSAKVCache)
+        self.assertEqual(cache[1].offset.tolist(), [11, 13])
+        self.assertEqual(cache[1].index_keys.shape, (2, 13, 8))
+
+    def test_left_padded_qsa_masks_match_independent_rows(self):
+        indexer = Qwen4ExpAttention(tiny_config().text_config).indexer
+        first_hidden = mx.random.normal((1, 10, 32))
+        second_hidden = mx.random.normal((1, 12, 32))
+        batch_hidden = mx.concatenate(
+            [mx.pad(first_hidden, [(0, 0), (2, 0), (0, 0)]), second_hidden]
+        )
+
+        first_cache = QSAKVCache()
+        second_cache = QSAKVCache()
+        batch_cache = BatchQSAKVCache([2, 0])
+        first_mask = indexer(first_hidden, first_cache, mx.arange(10)[None])
+        second_mask = indexer(second_hidden, second_cache, mx.arange(12)[None])
+        batch_mask = indexer(
+            batch_hidden,
+            batch_cache,
+            mx.array([[0, 0, *range(10)], list(range(12))]),
+        )
+
+        first_kv = mx.zeros((1, 1, 10, 2))
+        second_kv = mx.zeros((1, 1, 12, 2))
+        batch_kv = mx.zeros((2, 1, 12, 2))
+        first_cache.update_and_fetch(first_kv, first_kv)
+        second_cache.update_and_fetch(second_kv, second_kv)
+        batch_cache.update_and_fetch(batch_kv, batch_kv)
+        first_decode_hidden = mx.random.normal((1, 1, 32))
+        second_decode_hidden = mx.random.normal((1, 1, 32))
+        first_decode_mask = indexer(first_decode_hidden, first_cache, mx.array([[10]]))
+        second_decode_mask = indexer(
+            second_decode_hidden, second_cache, mx.array([[12]])
+        )
+        batch_decode_mask = indexer(
+            mx.concatenate([first_decode_hidden, second_decode_hidden]),
+            batch_cache,
+            mx.array([[10], [12]]),
+        )
+        mx.eval(
+            first_mask,
+            second_mask,
+            batch_mask,
+            first_decode_mask,
+            second_decode_mask,
+            batch_decode_mask,
+        )
+
+        self.assertTrue(mx.array_equal(batch_mask[0, :, 2:, 2:], first_mask[0]).item())
+        self.assertTrue(mx.array_equal(batch_mask[1], second_mask[0]).item())
+        self.assertTrue(
+            mx.array_equal(batch_decode_mask[0, :, :, 2:], first_decode_mask[0]).item()
+        )
+        self.assertTrue(
+            mx.array_equal(batch_decode_mask[1], second_decode_mask[0]).item()
+        )
+
+    def test_qsa_batch_cache_state_round_trip(self):
+        cache = BatchQSAKVCache([1, 0])
+        keys = mx.arange(12, dtype=mx.float32).reshape(2, 1, 3, 2)
+        positions = mx.array([[0, 0, 1], [0, 1, 2]], dtype=mx.int32)
+        cache.update_and_fetch(keys, keys)
+        cache.update_indexer(
+            mx.arange(12, dtype=mx.float32).reshape(2, 3, 2), positions
+        )
+
+        restored = BatchQSAKVCache([0, 0])
+        restored.state = cache.state
+        mx.eval(restored.state)
+
+        self.assertEqual(restored.offset.tolist(), [2, 3])
+        self.assertEqual(restored.left_padding.tolist(), [1, 0])
+        self.assertEqual(restored.index_offset, 3)
+        self.assertTrue(mx.array_equal(restored.index_position_ids, positions).item())
+
+    def test_empty_qsa_batch_cache_state_round_trip(self):
+        cache = BatchQSAKVCache([2, 0])
+        restored = BatchQSAKVCache([0, 0])
+
+        restored.state = cache.state
+
+        self.assertTrue(restored.empty())
+        self.assertEqual(restored.offset.tolist(), [-2, 0])
+        self.assertEqual(restored.left_padding.tolist(), [2, 0])
 
     def test_sanitize_maps_packed_experts_and_ngram_shards(self):
         model = qwen4_exp.Model(tiny_config())

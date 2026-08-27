@@ -9,13 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput
-from ..cache import (
-    ArraysCache,
-    BatchKVCache,
-    KVCache,
-    QuantizedKVCache,
-    dynamic_roll,
-)
+from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
@@ -384,8 +378,18 @@ class BatchQSAKVCache:
 
     @property
     def state(self):
+        kv_state = (
+            (
+                None,
+                None,
+                self.kv_cache.offset,
+                self.kv_cache.left_padding,
+            )
+            if self.kv_cache.empty()
+            else self.kv_cache.state
+        )
         return (
-            self.kv_cache.state,
+            kv_state,
             (
                 None
                 if self.index_keys is None
@@ -401,7 +405,13 @@ class BatchQSAKVCache:
     @state.setter
     def state(self, value):
         kv_state, self.index_keys, self.index_position_ids = value
-        self.kv_cache.state = kv_state
+        keys, values, offset, left_padding = kv_state
+        self.kv_cache = BatchKVCache([0] * int(offset.size))
+        self.kv_cache.keys = keys
+        self.kv_cache.values = values
+        self.kv_cache.offset = offset
+        self.kv_cache.left_padding = left_padding
+        self.kv_cache._idx = 0 if keys is None else keys.shape[2]
         self.index_offset = 0 if self.index_keys is None else self.index_keys.shape[1]
 
     @property
@@ -573,6 +583,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
+        if isinstance(start, mx.array) and start.ndim > 0:
+            return start[:, None] + mx.arange(length, dtype=mx.int32)[None]
         positions = mx.arange(start, start + length, dtype=mx.int32)
         return mx.broadcast_to(positions[None], (batch, length))
 
@@ -613,6 +625,26 @@ class Qwen4ExpQSAIndexer(nn.Module):
         else:
             full_position_ids = position_ids
 
+        left_padding = getattr(cache, "left_padding", None)
+        if (
+            isinstance(left_padding, mx.array)
+            and left_padding.ndim > 0
+            and left_padding.size == batch
+        ):
+            raw_keys = dynamic_roll(raw_keys, -left_padding, axis=1)
+            if full_position_ids.ndim == 3:
+                position_shifts = mx.broadcast_to(
+                    -left_padding[None],
+                    (full_position_ids.shape[0], batch),
+                )
+                full_position_ids = dynamic_roll(
+                    full_position_ids, position_shifts, axis=2
+                )
+            else:
+                full_position_ids = dynamic_roll(
+                    full_position_ids, -left_padding, axis=1
+                )
+
         key_len = raw_keys.shape[1]
         max_complete_blocks = key_len // self.compress_ratio
         if max_complete_blocks <= self.block_topk:
@@ -642,11 +674,15 @@ class Qwen4ExpQSAIndexer(nn.Module):
         scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
-        query_ends = past_len + mx.arange(seq_len) + 1
+        if isinstance(past_len, mx.array) and past_len.ndim > 0:
+            query_ends = past_len[:, None] + mx.arange(seq_len)[None] + 1
+        else:
+            query_ends = mx.broadcast_to(
+                (past_len + mx.arange(seq_len) + 1)[None], (batch, seq_len)
+            )
         complete_counts = query_ends // self.compress_ratio
         valid_blocks = (
-            mx.arange(max_complete_blocks)[None, None, :]
-            < complete_counts[None, :, None]
+            mx.arange(max_complete_blocks)[None, None, :] < complete_counts[..., None]
         )
         scores = mx.where(valid_blocks, scores, -mx.inf)
         selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
@@ -677,14 +713,22 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         token_indices = mx.arange(key_len)
         tail_starts = complete_counts * self.compress_ratio
-        tail = (token_indices[None, None, :] >= tail_starts[None, :, None]) & (
-            token_indices[None, None, :] < query_ends[None, :, None]
+        tail = (token_indices[None, None, :] >= tail_starts[..., None]) & (
+            token_indices[None, None, :] < query_ends[..., None]
         )
-        causal = token_indices[None, None, :] < query_ends[None, :, None]
+        causal = token_indices[None, None, :] < query_ends[..., None]
         use_sparse = complete_counts > self.block_topk
         selected_tokens = mx.where(
-            use_sparse[None, :, None], selected_tokens | tail, causal
+            use_sparse[..., None], selected_tokens | tail, causal
         )
+        if (
+            isinstance(left_padding, mx.array)
+            and left_padding.ndim > 0
+            and left_padding.size == batch
+        ):
+            selected_tokens = dynamic_roll(
+                selected_tokens, left_padding[:, None], axis=2
+            )
         return selected_tokens[:, None]
 
 
