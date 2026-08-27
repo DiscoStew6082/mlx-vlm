@@ -15,6 +15,7 @@ class Glm5NextMTPDraftModel(nn.Module):
     requires_uniform_batch_acceptance = True
     supports_ragged_batch_acceptance = False
     requires_filterable_batch_cache = True
+    supports_batched_prompt_prefill = True
 
     # Never-lose gate: a single nextn head caps the block at 2 tokens, so a round
     # only pays off when the draft is accepted often enough to clear the verify
@@ -115,10 +116,10 @@ class Glm5NextMTPDraftModel(nn.Module):
         del shared_kv_states, kv_offset, position, kv_valid_len, left_padding
 
     def _mask_for(self, x: mx.array, cache) -> Optional[mx.array]:
-        if cache is None or x.shape[1] == 1:
+        if cache is None:
             return None
         mla = cache[0]
-        ref = mla if (mla is not None and not mla.empty()) else None
+        ref = mla if mla is not None else None
         return create_attention_mask(x, ref, return_array=True)
 
     def _forward_tokens(

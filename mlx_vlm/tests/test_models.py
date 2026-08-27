@@ -3559,6 +3559,55 @@ class TestModels(unittest.TestCase):
         from mlx_vlm.models.glm5_next.language import LanguageModel
         from mlx_vlm.speculative.drafters.glm5_next_mtp import Model, ModelConfig
 
+        class RecordingDrafter(Model):
+            def __init__(self, config):
+                super().__init__(config)
+                self.prefill_observations = []
+                self.prefill_visible_keys = []
+                self.decode_visible_keys = []
+
+            def _mask_for(self, x, cache):
+                mask = super()._mask_for(x, cache)
+                if (
+                    x.shape[1] > 1
+                    and mask is not None
+                    and not self.prefill_visible_keys
+                ):
+                    mask = mx.broadcast_to(
+                        mask, (x.shape[0], 1, x.shape[1], x.shape[1])
+                    )
+                    self.prefill_visible_keys = mask[:, 0, -1, :].tolist()
+                elif x.shape[1] == 1 and not self.decode_visible_keys:
+                    self.decode_visible_keys = (
+                        [] if mask is None else mask[:, 0, -1, :].tolist()
+                    )
+                return mask
+
+            def prefill_from_target_hidden(
+                self,
+                input_ids,
+                hidden,
+                bonus_token,
+                sampler,
+                token_dtype=mx.int32,
+                greedy=False,
+            ):
+                self.prefill_observations.append(
+                    {
+                        "input_ids": input_ids.tolist(),
+                        "hidden_shape": hidden.shape,
+                        "left_padding": self._cache[0][0].left_padding.tolist(),
+                    }
+                )
+                return super().prefill_from_target_hidden(
+                    input_ids,
+                    hidden,
+                    bonus_token,
+                    sampler,
+                    token_dtype,
+                    greedy,
+                )
+
         class NeverStop:
             def __call__(self, _token):
                 return False
@@ -3615,7 +3664,7 @@ class TestModels(unittest.TestCase):
         max_tokens = [3, 5]
 
         expected = generate(target, prompts, max_tokens)
-        drafter = Model(ModelConfig(text_config=config, block_size=2))
+        drafter = RecordingDrafter(ModelConfig(text_config=config, block_size=2))
         drafter.eval()
         mx.eval(drafter.parameters())
         actual = generate(target, prompts, max_tokens, drafter=drafter)
@@ -3623,6 +3672,30 @@ class TestModels(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual([len(row) for row in actual], max_tokens)
         self.assertIn(0, drafter.accept_lens)
+        self.assertEqual(
+            drafter.prefill_observations,
+            [
+                {
+                    "input_ids": [[0, 0, 2, 4, 6], [3, 5, 7, 9, 11]],
+                    "hidden_shape": (2, 5, config.hidden_size),
+                    "left_padding": [2, 0],
+                }
+            ],
+        )
+        self.assertEqual(
+            drafter.prefill_visible_keys,
+            [
+                [False, False, True, True, True],
+                [True, True, True, True, True],
+            ],
+        )
+        self.assertEqual(
+            drafter.decode_visible_keys,
+            [
+                [False, False, True, True, True, True],
+                [True, True, True, True, True, True],
+            ],
+        )
 
     def test_glm5_next_swiglu_clamp(self):
         # The text stack must apply config.swiglu_limit (reference clamps every text MLP);

@@ -845,6 +845,42 @@ def _mtp_cache_positions(
     return max_offset, [max_offset] * batch_size
 
 
+def _mtp_batch_prompt_left_padding(
+    prompt_cache: List[Any], prompt_tokens: mx.array, batch_size: int
+) -> Optional[List[int]]:
+    """Return canonical prompt padding, ignoring advanced recurrent caches."""
+    width = int(prompt_tokens.shape[1])
+
+    def find(entry: Any) -> Optional[List[int]]:
+        children = getattr(entry, "caches", None)
+        if children is not None:
+            for child in children:
+                result = find(child)
+                if result is not None:
+                    return result
+
+        left_padding = getattr(entry, "left_padding", None)
+        if left_padding is None:
+            return None
+        values = (
+            left_padding.tolist()
+            if hasattr(left_padding, "tolist")
+            else list(left_padding)
+        )
+        if len(values) != batch_size:
+            return None
+        values = [int(value) for value in values]
+        if all(0 <= value <= width for value in values):
+            return values
+        return None
+
+    for entry in prompt_cache:
+        result = find(entry)
+        if result is not None:
+            return result
+    return None
+
+
 def _mtp_draft_position(kv_valid_len: Any) -> Any:
     if isinstance(kv_valid_len, int):
         return max(kv_valid_len - 1, 0)
@@ -951,6 +987,7 @@ def _mtp_rounds_batch(
     hidden: mx.array,
     shared_kv_states: dict,
     *,
+    prompt_tokens: Optional[mx.array] = None,
     first_bonus: mx.array,
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
@@ -980,10 +1017,28 @@ def _mtp_rounds_batch(
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    batch_prefill = (
+        block_total > 1
+        and max_tokens > 1
+        and getattr(draft_model, "supports_batched_prompt_prefill", False)
+        and callable(prefill_draft)
+        and prompt_tokens is not None
+    )
+    batch_left_padding = (
+        _mtp_batch_prompt_left_padding(prompt_cache, prompt_tokens, B)
+        if batch_prefill
+        else None
+    )
     if getattr(draft_model, "supports_ragged_batch_acceptance", False) or (
         B > 1 and getattr(draft_model, "requires_filterable_batch_cache", False)
     ):
-        draft_model.reset(model, left_padding=[0] * B)
+        reset_left_padding = (
+            batch_left_padding
+            if batch_prefill and batch_left_padding is not None
+            else [0] * B
+        )
+        draft_model.reset(model, left_padding=reset_left_padding)
     else:
         draft_model.reset(model)
     sampler_rng = _SpeculativeSamplerRNG(
@@ -991,6 +1046,17 @@ def _mtp_rounds_batch(
         enabled=not greedy_sampling
         and not _sampler_supports_positioned_target(sampler),
     )
+
+    if batch_prefill:
+        sampler_rng.draft_call(
+            prefill_draft,
+            prompt_tokens,
+            hidden,
+            first_bonus,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+        )
 
     # First-round hidden: prefill output may have shape [B, L, H]; reduce
     # to a single slot per row (last prompt token's hidden — see comment in
