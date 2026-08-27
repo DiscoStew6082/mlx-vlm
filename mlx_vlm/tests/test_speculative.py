@@ -55,6 +55,7 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_lite_mtp
+from mlx_vlm.speculative.drafters.glm5_next_mtp.split import split_glm5_next_mtp
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
@@ -3453,6 +3454,69 @@ def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
     assert cfg["quantization_config"] == expected
     assert weights["layers.0.mlp.down_proj.weight"].dtype == mx.uint32
     assert weights["layers.0.mlp.down_proj.scales"].dtype == mx.uint8
+    assert not any(key.endswith("weight_scale_inv") for key in weights)
+
+
+def test_split_glm5_next_mtp_converts_fine_grained_fp8(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = {
+        "model_type": "glm5_next_text",
+        "num_hidden_layers": 1,
+        "num_nextn_predict_layers": 1,
+        "n_routed_experts": 1,
+        "qk_nope_head_dim": 4,
+        "v_head_dim": 4,
+        "num_attention_heads": 2,
+    }
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config,
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    prefix = "model.language_model.layers.1."
+    fp8 = mx.to_fp8(mx.ones((128, 128), dtype=mx.bfloat16))
+    scale = mx.full((1, 1), 0.125, dtype=mx.bfloat16)
+    tensors = {
+        f"{prefix}eh_proj.weight": mx.ones((128, 128), dtype=mx.bfloat16),
+    }
+    for projection in ("down_proj", "gate_proj", "up_proj"):
+        key = f"{prefix}mlp.experts.0.{projection}.weight"
+        tensors[key] = fp8
+        tensors[f"{key}_scale_inv"] = scale
+    mx.save_safetensors(str(source / "mtp.safetensors"), tensors, metadata={})
+
+    split_glm5_next_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert cfg["quantization"] == expected
+    assert cfg["quantization_config"] == expected
+    for projection in ("down_proj", "gate_proj", "up_proj"):
+        key = f"mtp.mlp.switch_mlp.{projection}"
+        assert weights[f"{key}.weight"].dtype == mx.uint32
+        assert weights[f"{key}.scales"].dtype == mx.uint8
+        restored = mx.dequantize(
+            weights[f"{key}.weight"],
+            weights[f"{key}.scales"],
+            None,
+            **expected,
+        )
+        source_value = mx.full(restored.shape, 0.125)
+        assert mx.max(mx.abs(restored - source_value)).item() <= 0.015625
+    assert weights["mtp.eh_proj.weight"].dtype == mx.bfloat16
+    assert "mtp.eh_proj.scales" not in weights
     assert not any(key.endswith("weight_scale_inv") for key in weights)
 
 
