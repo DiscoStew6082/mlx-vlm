@@ -3884,3 +3884,109 @@ def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
     assert out["model.mtp_block.mlp.gate.e_score_correction_bias"].dtype == mx.float32
     # non-parameter buffers are dropped
     assert not any(k.endswith("rotary_emb.inv_freq") for k in out)
+
+
+def test_mtp_target_prefill_layout_preserves_residual_padding_and_row_ids():
+    cache = SimpleNamespace(left_padding=mx.array([4, 0]), _idx=6)
+    layout = mtp_utils._mtp_batch_prompt_layout(
+        [SimpleNamespace(caches=[cache])], mx.zeros((2, 3), dtype=mx.int32), [9, 2]
+    )
+    assert layout.row_ids == (9, 2)
+    assert layout.original_left_padding == (4, 0)
+    assert layout.processed_columns == 3
+    assert layout.residual_left_padding == (1, 0)
+
+
+def test_glm_splitter_rejects_unsynchronized_fp8_tensor_value():
+    from mlx_vlm.speculative.drafters.glm5_next_mtp.split import Glm5NextMTPSplitter
+
+    splitter = Glm5NextMTPSplitter()
+    key = "model.layers.1.eh_proj.weight"
+    config = {"num_hidden_layers": 1}
+    tensors = splitter.run_sanitize(
+        {
+            key: mx.to_fp8(mx.ones((128, 128), dtype=mx.bfloat16)),
+            key + "_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
+        },
+        config,
+    )
+    tensors["mtp.eh_proj.weight"] = mx.zeros((128, 128), dtype=mx.bfloat16)
+    with pytest.raises(ValueError, match="without its source provenance"):
+        splitter.quantization_from_source(
+            tensors,
+            {
+                "model_type": "glm5_next",
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            },
+        )
+
+
+def test_mtp_batch_handoff_resets_once_with_residual_suffix_padding():
+    calls = []
+
+    class PrefillObserved(Exception):
+        pass
+
+    def reset(model, left_padding=None):
+        calls.append(("reset", left_padding))
+
+    def prefill(tokens, hidden, bonus, sampler, token_dtype):
+        calls.append(("prefill", tokens.shape, hidden.shape))
+        raise PrefillObserved
+
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(block_size=2),
+        supports_batched_prompt_prefill=True,
+        supports_apc_prompt_prefill=False,
+        requires_filterable_batch_cache=True,
+        reset=reset,
+        prefill_from_target_hidden=prefill,
+    )
+    target = SimpleNamespace(rollback_speculative_cache=lambda *args: None)
+    cache = SimpleNamespace(left_padding=mx.array([4, 0]), _idx=6)
+    rounds = mtp_utils._mtp_rounds_batch(
+        target,
+        drafter,
+        [cache],
+        mx.zeros((2, 3, 16)),
+        {},
+        prompt_tokens=mx.zeros((2, 3), dtype=mx.int32),
+        first_bonus=mx.array([1, 2]),
+        max_tokens=2,
+        sampler=lambda logits: logits,
+        greedy_sampling=True,
+        row_ids=[9, 2],
+    )
+    with pytest.raises(PrefillObserved):
+        next(rounds)
+    assert calls == [("reset", [1, 0]), ("prefill", (2, 3), (2, 3, 16))]
+
+
+def test_mtp_batch_handoff_rejects_missing_hidden_coverage_before_reset():
+    resets = []
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(block_size=2),
+        supports_batched_prompt_prefill=True,
+        reset=lambda *args, **kwargs: resets.append(True),
+        prefill_from_target_hidden=lambda *args: None,
+    )
+    target = SimpleNamespace(rollback_speculative_cache=lambda *args: None)
+    rounds = mtp_utils._mtp_rounds_batch(
+        target,
+        drafter,
+        [],
+        mx.zeros((2, 1, 16)),
+        {},
+        prompt_tokens=mx.zeros((2, 3), dtype=mx.int32),
+        first_bonus=mx.array([1, 2]),
+        max_tokens=2,
+        sampler=lambda logits: logits,
+        greedy_sampling=True,
+    )
+    with pytest.raises(ValueError, match="exactly the prompt suffix"):
+        next(rounds)
+    assert resets == []

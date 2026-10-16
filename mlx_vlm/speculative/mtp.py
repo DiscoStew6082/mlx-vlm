@@ -16,6 +16,7 @@ from .common import (
     _SpeculativeSamplerRNG,
     generation_stream,
 )
+from .prompt_layout import PromptLayout, TargetPrefillResult
 
 
 @dataclass
@@ -845,13 +846,13 @@ def _mtp_cache_positions(
     return max_offset, [max_offset] * batch_size
 
 
-def _mtp_batch_prompt_left_padding(
-    prompt_cache: List[Any], prompt_tokens: mx.array, batch_size: int
-) -> Optional[List[int]]:
-    """Return residual suffix padding from a target KV cache."""
+def _mtp_batch_prompt_layout(
+    prompt_cache: List[Any], prompt_tokens: mx.array, row_ids: List[int]
+) -> PromptLayout:
+    """Capture original and residual padding once at target-prefill handoff."""
     width = int(prompt_tokens.shape[1])
 
-    def find(entry: Any) -> Optional[List[int]]:
+    def find(entry: Any) -> Optional[PromptLayout]:
         children = getattr(entry, "caches", None)
         if children is not None:
             for child in children:
@@ -868,19 +869,35 @@ def _mtp_batch_prompt_left_padding(
             if hasattr(left_padding, "tolist")
             else list(left_padding)
         )
-        if len(values) != batch_size:
+        if len(values) != len(row_ids):
             return None
-        processed_columns = max(int(cached_width) - width, 0)
-        values = [max(int(value) - processed_columns, 0) for value in values]
-        if all(0 <= value <= width for value in values):
-            return values
-        return None
+        try:
+            return PromptLayout(
+                tuple(row_ids),
+                width,
+                tuple(int(value) for value in values),
+                max(int(cached_width) - width, 0),
+            )
+        except ValueError:
+            return None
 
     for entry in prompt_cache:
         result = find(entry)
         if result is not None:
             return result
-    return None
+    return PromptLayout(tuple(row_ids), width, None, None)
+
+
+def _mtp_batch_prompt_left_padding(
+    prompt_cache: List[Any], prompt_tokens: mx.array, batch_size: int
+) -> Optional[List[int]]:
+    """Compatibility helper; layout owns the residual-padding calculation."""
+    layout = _mtp_batch_prompt_layout(
+        prompt_cache, prompt_tokens, list(range(batch_size))
+    )
+    if layout.original_left_padding is None:
+        return None
+    return list(layout.residual_left_padding)
 
 
 def _mtp_draft_position(kv_valid_len: Any) -> Any:
@@ -1027,8 +1044,17 @@ def _mtp_rounds_batch(
         and callable(prefill_draft)
         and prompt_tokens is not None
     )
-    batch_left_padding = (
-        _mtp_batch_prompt_left_padding(prompt_cache, prompt_tokens, B)
+    prefill_result = (
+        TargetPrefillResult(
+            layout=_mtp_batch_prompt_layout(prompt_cache, prompt_tokens, row_ids),
+            prompt_tokens=prompt_tokens,
+            hidden=hidden,
+            cache_reuse=(
+                "target_prefix"
+                if getattr(draft_model, "supports_apc_prompt_prefill", True)
+                else "cold_only"
+            ),
+        )
         if batch_prefill
         else None
     )
@@ -1036,8 +1062,8 @@ def _mtp_rounds_batch(
         B > 1 and getattr(draft_model, "requires_filterable_batch_cache", False)
     ):
         reset_left_padding = (
-            batch_left_padding
-            if batch_prefill and batch_left_padding is not None
+            list(prefill_result.layout.residual_left_padding)
+            if prefill_result is not None
             else [0] * B
         )
         draft_model.reset(model, left_padding=reset_left_padding)
@@ -1049,11 +1075,11 @@ def _mtp_rounds_batch(
         and not _sampler_supports_positioned_target(sampler),
     )
 
-    if batch_prefill:
+    if prefill_result is not None:
         sampler_rng.draft_call(
             prefill_draft,
-            prompt_tokens,
-            hidden,
+            prefill_result.prompt_tokens,
+            prefill_result.hidden,
             first_bonus,
             sampler,
             token_dtype,

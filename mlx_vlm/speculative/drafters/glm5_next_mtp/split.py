@@ -6,6 +6,7 @@ from typing import Dict, Optional
 import mlx.core as mx
 
 from ..mtp_split import MTPSplitter
+from .tensor_provenance import SplitTensor
 
 FP8_BLOCK_SIZE = 128
 MLX_MXFP8_QUANTIZATION = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
@@ -70,7 +71,8 @@ class Glm5NextMTPSplitter(MTPSplitter):
     supports_mlx_source = False
 
     def __init__(self):
-        self._source_fp8_weight_keys: set[str] = set()
+        self._tensors: Dict[str, SplitTensor] = {}
+        self._needs_sanitize = False
 
     def _layer_idx(self, text_config: dict) -> int:
         return int(text_config["num_hidden_layers"])
@@ -81,58 +83,56 @@ class Glm5NextMTPSplitter(MTPSplitter):
     def run_sanitize(
         self, tensors: Dict[str, mx.array], text_config: dict
     ) -> Dict[str, mx.array]:
+        self._tensors = {}
+        # Source provenance is usable only after the complete sanitize succeeds.
+        # A failed re-sanitize must not re-enable retries on old decoded values.
+        self._needs_sanitize = True
         marker = f"layers.{self._layer_idx(text_config)}."
-        source_fp8_keys = {
-            key[: -len("_scale_inv")]
-            for key in tensors
-            if key.endswith(".weight_scale_inv")
+        records = {
+            key: SplitTensor(key, value, (key,)) for key, value in tensors.items()
         }
-        tensors = dict(tensors)
-        for weight_key in sorted(source_fp8_keys):
-            scale_key = f"{weight_key}_scale_inv"
-            if weight_key not in tensors:
+        scale_keys = sorted(key for key in records if key.endswith(".weight_scale_inv"))
+        for scale_key in scale_keys:
+            weight_key = scale_key[: -len("_scale_inv")]
+            if weight_key not in records:
                 raise ValueError(f"Missing FP8 weight for scale tensor {scale_key!r}.")
             restored = _dequantize_fine_grained_fp8_weight(
-                tensors.pop(weight_key), tensors.pop(scale_key)
+                records.pop(weight_key).value, records.pop(scale_key).value
             )
             mx.eval(restored)
-            tensors[weight_key] = restored
+            records[weight_key] = SplitTensor(
+                weight_key, restored, (weight_key,), "fp8_e4m3", (128, 128), "decoded"
+            )
 
-        out: Dict[str, mx.array] = {}
-        mapped_fp8_keys: set[str] = set()
-        for key, value in tensors.items():
+        out: Dict[str, SplitTensor] = {}
+        for key, record in records.items():
             rest = key[key.index(marker) + len(marker) :]
             if rest.startswith("shared_head.norm."):
                 rest = "shared_head_norm." + rest[len("shared_head.norm.") :]
-            out[rest] = value
-            if key in source_fp8_keys:
-                mapped_fp8_keys.add(f"mtp.{rest}")
+            destination = f"mtp.{rest}"
+            out[destination] = record.transformed(destination, record.value)
 
-        # Absorb the fused MLA kv_b_proj into embed_q / unembed_out (as the base model's
-        # Glm5NextSparseAttention expects).
-        kb = "self_attn.kv_b_proj.weight"
+        # Transform the descriptor alongside the value. Both absorbed projections
+        # inherit the fused source's encoding and scale layout automatically.
+        kb = "mtp.self_attn.kv_b_proj.weight"
         if kb in out:
-            v = out.pop(kb)
+            record = out.pop(kb)
             nope = int(text_config["qk_nope_head_dim"])
             vhd = int(text_config["v_head_dim"])
             nheads = int(text_config["num_attention_heads"])
-            v = v.reshape(nheads, nope + vhd, -1)
-            out["self_attn.embed_q.weight"] = mx.contiguous(
-                v[:, :nope, :].swapaxes(-1, -2)
-            )
-            out["self_attn.unembed_out.weight"] = mx.contiguous(v[:, nope:, :])
-            mapped_kb = f"mtp.{kb}"
-            if mapped_kb in mapped_fp8_keys:
-                mapped_fp8_keys.remove(mapped_kb)
-                mapped_fp8_keys.update(
-                    {
-                        "mtp.self_attn.embed_q.weight",
-                        "mtp.self_attn.unembed_out.weight",
-                    }
-                )
+            v = record.value.reshape(nheads, nope + vhd, -1)
+            for destination, value in (
+                (
+                    "mtp.self_attn.embed_q.weight",
+                    mx.contiguous(v[:, :nope, :].swapaxes(-1, -2)),
+                ),
+                ("mtp.self_attn.unembed_out.weight", mx.contiguous(v[:, nope:, :])),
+            ):
+                out[destination] = record.transformed(destination, value)
 
-        self._source_fp8_weight_keys = mapped_fp8_keys
-        return {f"mtp.{key}": value for key, value in out.items()}
+        self._tensors = out
+        self._needs_sanitize = False
+        return {key: record.value for key, record in out.items()}
 
     def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
         # Stack per-expert MoE projections into the SwitchGLU layout when the source
@@ -152,17 +152,55 @@ class Glm5NextMTPSplitter(MTPSplitter):
                 keys = [f"{prefix}.{e}.{proj}.weight" for e in range(n_experts)]
                 if all(k in tensors for k in keys):
                     stacked_key = f"{base}.switch_mlp.{proj}.weight"
-                    tensors[stacked_key] = mx.stack([tensors.pop(k) for k in keys])
-                    if all(k in self._source_fp8_weight_keys for k in keys):
-                        self._source_fp8_weight_keys.difference_update(keys)
-                        self._source_fp8_weight_keys.add(stacked_key)
+                    records = [self._tensors[k] for k in keys]
+                    for record in records:
+                        record.require_current_value(tensors)
+                    # Validate source compatibility before modifying either map.
+                    stacked = SplitTensor.stacked(
+                        stacked_key,
+                        mx.stack([record.value for record in records]),
+                        records,
+                    )
+                    for key in keys:
+                        del tensors[key]
+                        del self._tensors[key]
+                    self._tensors[stacked_key] = stacked
+                    tensors[stacked_key] = stacked.value
 
     def quantization_from_source(self, tensors, source_config):
+        # Descriptors own arrays only while transforming them. A splitter may
+        # outlive its returned weights (for example during model-card/upload
+        # work), so neither successful handoff nor failure may pin those arrays.
+        if self._needs_sanitize:
+            raise ValueError(
+                "Run GLM sanitize again before retrying a failed conversion"
+            )
+        try:
+            return self._quantization_from_source(tensors, source_config)
+        except Exception:
+            # A retry must rebuild source provenance instead of treating the
+            # partially converted values as a native checkpoint.
+            self._needs_sanitize = True
+            raise
+        finally:
+            self._tensors.clear()
+
+    def _quantization_from_source(self, tensors, source_config):
+        fp8_keys = [
+            key
+            for key, record in self._tensors.items()
+            if record.source_encoding == "fp8_e4m3"
+            and record.value_encoding != "mlx_mxfp8"
+        ]
         if any(key.endswith(".scales") for key in tensors):
+            if fp8_keys:
+                raise ValueError(
+                    "Cannot mix native MLX and fine-grained FP8 source tensors"
+                )
             return source_config.get("quantization") or source_config.get(
                 "quantization_config"
             )
-        if not self._source_fp8_weight_keys:
+        if not fp8_keys:
             return None
         source_quantization = source_config.get("quantization_config") or {}
         supported = (
@@ -177,17 +215,21 @@ class Glm5NextMTPSplitter(MTPSplitter):
                 "FP8 weights with 128x128 blocks."
             )
 
-        for weight_key in sorted(self._source_fp8_weight_keys):
-            if weight_key not in tensors:
-                raise ValueError(
-                    f"FP8 source weight was lost during MTP conversion: {weight_key!r}."
-                )
-            quantized = mx.quantize(tensors[weight_key], **MLX_MXFP8_QUANTIZATION)
+        for key in fp8_keys:
+            self._tensors[key].require_current_value(tensors)
+        for weight_key in sorted(fp8_keys):
+            record = self._tensors[weight_key]
+            quantized = mx.quantize(record.value, **MLX_MXFP8_QUANTIZATION)
             if len(quantized) != 2:
                 raise ValueError("MLX MXFP8 quantization unexpectedly produced biases.")
             packed, scales = quantized
             mx.eval(packed, scales)
             tensors[weight_key] = packed
+            # Release the dequantized value as each destination is packed; the
+            # descriptor keeps source provenance without retaining the large buffer.
+            self._tensors[weight_key] = record.transformed(
+                weight_key, packed, value_encoding="mlx_mxfp8"
+            )
             tensors[weight_key[: -len(".weight")] + ".scales"] = scales
         return dict(MLX_MXFP8_QUANTIZATION)
 
