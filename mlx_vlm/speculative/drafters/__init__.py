@@ -22,6 +22,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "glm5_next_mtp": "mtp",
     "inkling_mtp": "mtp",
     "qwen3_5_mtp": "mtp",
+    "qwen4_exp_mtp": "mtp",
     "laguna": "dflash",
     "muse_glimmer_assistant": "dflash",
 }
